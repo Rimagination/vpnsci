@@ -60,7 +60,7 @@ vpnsci schools
 ## 环境要求
 
 - Python >= 3.10
-- Chrome 浏览器（首次校园网登录需要）
+- CloakBrowser（自动安装，用于 CAS 登录和 Cloudflare 绕过）
 - Docker（仅部分学校需要，Agent 会自动提示）
 
 ## 免责声明

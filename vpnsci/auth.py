@@ -1,4 +1,4 @@
-"""WebVPN proxy authentication management using Selenium."""
+"""WebVPN proxy authentication management using CloakBrowser."""
 
 import binascii
 import json
@@ -9,8 +9,13 @@ from urllib.parse import urlparse
 
 import requests
 from Crypto.Cipher import AES
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
+
+try:
+    from cloakbrowser import launch
+    _HAS_CLOAKBROWSER = True
+except ImportError:
+    launch = None  # type: ignore[assignment]
+    _HAS_CLOAKBROWSER = False
 
 from .config import Config
 
@@ -41,7 +46,9 @@ class WebVPNAuth:
         self._encrypt_key = key or WEBVPN_DEFAULT_KEY
         self._encrypt_iv = iv or self._encrypt_key
         self._session: requests.Session | None = None
-        self._driver: webdriver.Chrome | None = None
+        self._browser = None
+        self._context = None
+        self._page = None
         self._webvpn_base = self.config.webvpn_base_url.rstrip("/")
 
     @property
@@ -137,8 +144,19 @@ class WebVPNAuth:
             logger.warning("Failed to read cookies: %s", e)
             return False
 
+        # Filter out expired cookies
+        now = time.time()
+        valid_cookies = [
+            c for c in cookies
+            if self._is_cookie_valid(c, now)
+        ]
+
+        if not valid_cookies:
+            logger.info("All saved cookies have expired.")
+            return False
+
         # Load cookies into session
-        for cookie in cookies:
+        for cookie in valid_cookies:
             self.session.cookies.set(
                 cookie["name"],
                 cookie["value"],
@@ -148,6 +166,16 @@ class WebVPNAuth:
 
         # Validate by making a test request
         return self._validate_session()
+
+    @staticmethod
+    def _is_cookie_valid(cookie: dict, now: float | None = None) -> bool:
+        """Check if a cookie is not expired. expires=0 means session cookie (always valid)."""
+        expires = cookie.get("expires", 0)
+        if not expires or expires == 0:
+            return True
+        if now is None:
+            now = time.time()
+        return expires > now
 
     def _validate_session(self) -> bool:
         """Check if the current session can access content through the gateway."""
@@ -171,26 +199,24 @@ class WebVPNAuth:
         return False
 
     def _browser_login(self) -> bool:
-        """Open Chrome for manual login via WebVPN or EasyConnect portal."""
-        options = Options()
-        options.add_argument("--no-first-run")
-        options.add_argument("--no-default-browser-check")
-        options.add_argument("--remote-allow-origins=*")
-        options.add_argument("--start-maximized")
-        options.add_experimental_option("excludeSwitches", ["enable-automation"])
+        """Open CloakBrowser for manual login via WebVPN or EasyConnect portal."""
+        if not _HAS_CLOAKBROWSER:
+            logger.error("cloakbrowser not installed. Run: pip install cloakbrowser")
+            return False
 
         try:
-            self._driver = webdriver.Chrome(options=options)
-        except Exception as e:
-            logger.error("Failed to start Chrome: %s", e)
-            logger.error(
-                "Make sure Chrome is installed and no other ChromeDriver "
-                "instances are running."
+            self._browser = launch(
+                headless=False, humanize=True,
+                args=["--disable-features=CrossOriginOpenerPolicy"],
             )
+            self._context = self._browser.new_context()
+            self._page = self._context.new_page()
+        except Exception as e:
+            logger.error("Failed to start CloakBrowser: %s", e)
             return False
 
         # Navigate to login page
-        self._driver.get(self._webvpn_base)
+        self._page.goto(self._webvpn_base, wait_until="domcontentloaded")
 
         print("\n" + "=" * 60)
         print(f"  Please log in at {self._webvpn_base}")
@@ -209,14 +235,22 @@ class WebVPNAuth:
             elapsed += poll_interval
 
             try:
-                current_url = self._driver.current_url
+                # Check if user closed the browser
+                if not self._context.pages:
+                    logger.info("Browser closed by user.")
+                    self._browser = None
+                    self._context = None
+                    self._page = None
+                    return False
+
+                current_url = self._page.url
 
                 if current_url != last_url:
                     logger.info("Browser URL: %s", current_url)
                     last_url = current_url
 
                 # Detection 1: WebVPN session cookie (WebVPN schools)
-                cookies = self._driver.get_cookies()
+                cookies = self._context.cookies()
                 vpn_cookies = [
                     c for c in cookies
                     if "webvpn" in c.get("domain", "").lower()
@@ -230,7 +264,6 @@ class WebVPNAuth:
                     return True
 
                 # Detection 2: URL left login/CAS page (works for both WebVPN and EasyConnect)
-                # EasyConnect may redirect to a different gateway domain after login
                 on_login_page = "/login" in current_url.lower() or "cas" in current_url.lower()
                 is_gateway = (
                     self._webvpn_base in current_url
@@ -246,7 +279,9 @@ class WebVPNAuth:
 
             except Exception:
                 logger.warning("Browser connection lost.")
-                self._driver = None
+                self._browser = None
+                self._context = None
+                self._page = None
                 return False
 
         print("\n  Login timed out after 10 minutes.\n")
@@ -254,11 +289,11 @@ class WebVPNAuth:
         return False
 
     def _save_browser_cookies(self):
-        """Save cookies from Selenium browser to file and load into requests session."""
-        if not self._driver:
+        """Save cookies from CloakBrowser to file and load into requests session."""
+        if not self._context:
             return
 
-        cookies = self._driver.get_cookies()
+        cookies = self._context.cookies()
         cookie_path = Path(self.config.cookie_path)
         cookie_path.write_text(
             json.dumps(cookies, indent=2, ensure_ascii=False), encoding="utf-8"
@@ -275,13 +310,15 @@ class WebVPNAuth:
             )
 
     def _close_browser(self):
-        """Close the Selenium browser."""
-        if self._driver:
+        """Close the CloakBrowser."""
+        if self._browser:
             try:
-                self._driver.quit()
+                self._browser.close()
             except Exception:
                 pass
-            self._driver = None
+            self._browser = None
+            self._context = None
+            self._page = None
 
     def fetch(self, url: str, **kwargs) -> requests.Response:
         """Fetch a URL through the WebVPN, EasyConnect, or proxy session.
@@ -330,7 +367,9 @@ class EZProxyAuth:
         self.config.ensure_dirs()
         self._proxy_base = proxy_base or self.config.ezproxy_base_url
         self._session: requests.Session | None = None
-        self._driver: webdriver.Chrome | None = None
+        self._browser = None
+        self._context = None
+        self._page = None
 
     @property
     def session(self) -> requests.Session:
@@ -387,21 +426,23 @@ class EZProxyAuth:
             return False
 
     def _browser_login(self) -> bool:
-        """Open Chrome for manual EZproxy login."""
-        options = Options()
-        options.add_argument("--no-first-run")
-        options.add_argument("--no-default-browser-check")
-        options.add_argument("--remote-allow-origins=*")
-        options.add_argument("--start-maximized")
-        options.add_experimental_option("excludeSwitches", ["enable-automation"])
-
-        try:
-            self._driver = webdriver.Chrome(options=options)
-        except Exception as e:
-            logger.error("Failed to start Chrome: %s", e)
+        """Open CloakBrowser for manual EZproxy login."""
+        if not _HAS_CLOAKBROWSER:
+            logger.error("cloakbrowser not installed. Run: pip install cloakbrowser")
             return False
 
-        self._driver.get(self._proxy_base + TEST_URL)
+        try:
+            self._browser = launch(
+                headless=False, humanize=True,
+                args=["--disable-features=CrossOriginOpenerPolicy"],
+            )
+            self._context = self._browser.new_context()
+            self._page = self._context.new_page()
+        except Exception as e:
+            logger.error("Failed to start CloakBrowser: %s", e)
+            return False
+
+        self._page.goto(self._proxy_base + TEST_URL, wait_until="domcontentloaded")
 
         print("\n" + "=" * 60)
         print(f"  Please log in at the EZproxy page.")
@@ -418,7 +459,15 @@ class EZProxyAuth:
             elapsed += poll_interval
 
             try:
-                current_url = self._driver.current_url
+                # Check if user closed the browser
+                if not self._context.pages:
+                    logger.info("Browser closed by user.")
+                    self._browser = None
+                    self._context = None
+                    self._page = None
+                    return False
+
+                current_url = self._page.url
 
                 if current_url != last_url:
                     logger.info("Browser URL: %s", current_url)
@@ -435,7 +484,9 @@ class EZProxyAuth:
 
             except Exception:
                 logger.warning("Browser connection lost.")
-                self._driver = None
+                self._browser = None
+                self._context = None
+                self._page = None
                 return False
 
         print("\n  Login timed out after 10 minutes.\n")
@@ -443,10 +494,10 @@ class EZProxyAuth:
         return False
 
     def _save_browser_cookies(self):
-        """Save cookies from Selenium browser to file."""
-        if not self._driver:
+        """Save cookies from CloakBrowser to file."""
+        if not self._context:
             return
-        cookies = self._driver.get_cookies()
+        cookies = self._context.cookies()
         cookie_path = Path(self.config.cookie_path)
         cookie_path.write_text(
             json.dumps(cookies, indent=2, ensure_ascii=False), encoding="utf-8"
@@ -462,12 +513,14 @@ class EZProxyAuth:
             )
 
     def _close_browser(self):
-        if self._driver:
+        if self._browser:
             try:
-                self._driver.quit()
+                self._browser.close()
             except Exception:
                 pass
-            self._driver = None
+            self._browser = None
+            self._context = None
+            self._page = None
 
     def get_proxied_url(self, url: str) -> str:
         """Wrap a URL with the EZproxy prefix."""

@@ -19,6 +19,13 @@ from .extractors import html_extractor, pdf_extractor
 from .models import Paper
 from .sources import arxiv, unpaywall
 
+try:
+    from cloakbrowser import launch as _cb_launch
+    _HAS_CLOAKBROWSER = True
+except ImportError:
+    _cb_launch = None  # type: ignore[assignment]
+    _HAS_CLOAKBROWSER = False
+
 logger = logging.getLogger(__name__)
 
 DOI_PATTERN = re.compile(r"^10\.\d{4,9}/[^\s]+$")
@@ -117,6 +124,13 @@ class PaperFetcher:
             if pdf_paper and len(pdf_paper.full_text or "") >= MIN_FULLTEXT_LEN:
                 self._save_cache(pdf_paper)
                 return pdf_paper
+
+        # Step 4.5: Try browser-based PDF download (bypasses TLS fingerprinting)
+        if doi and not paper.pdf_path:
+            browser_paper = self._try_browser_pdf_download(doi, url, paper)
+            if browser_paper and len(browser_paper.full_text or "") >= MIN_FULLTEXT_LEN:
+                self._save_cache(browser_paper)
+                return browser_paper
 
         # Step 5: Fetch via WebVPN
         self._rate_limit()
@@ -322,6 +336,135 @@ class PaperFetcher:
             logger.warning("Failed to fetch publisher PDF: %s", e)
 
         return None
+
+    def _try_browser_pdf_download(self, doi: str, resolved_url: str, paper: Paper) -> Paper | None:
+        """Try to download PDF via CloakBrowser (bypasses TLS fingerprint detection).
+
+        Publishers like PNAS, Elsevier, Wiley detect TLS fingerprints and return 403
+        for Python HTTP clients even with valid cookies. This method uses a real browser
+        to download the PDF.
+        """
+        if not _HAS_CLOAKBROWSER:
+            return None
+
+        pdf_url = self._build_publisher_pdf_url(doi, resolved_url)
+        if not pdf_url:
+            return None
+
+        logger.info("Trying browser PDF download: %s", pdf_url)
+        print(f"  [Browser] Downloading PDF via browser to bypass TLS fingerprinting...")
+
+        browser = None
+        try:
+            browser = _cb_launch(
+                headless=False, humanize=True,
+                args=["--disable-features=CrossOriginOpenerPolicy"],
+            )
+            context = browser.new_context()
+
+            # Load saved cookies into browser context
+            self._load_cookies_to_context(context)
+
+            page = context.new_page()
+
+            # Capture PDF from network responses
+            captured_pdf: list[bytes] = []
+
+            def on_response(response):
+                try:
+                    ct = response.headers.get("content-type", "").lower()
+                    url = response.url
+                    is_pdf_ct = "pdf" in ct or "octet-stream" in ct
+                    is_pdf_url = url.lower().endswith(".pdf") or "/pdfdirect/" in url or "/doi/pdf/" in url
+                    if not (is_pdf_ct or is_pdf_url):
+                        return
+                    if response.status >= 400:
+                        return
+                    body = response.body()
+                    if len(body) > 5000 and body[:4] == b"%PDF-":
+                        captured_pdf.append(body)
+                        logger.info("Browser captured PDF: %d bytes from %s", len(body), url[:60])
+                except Exception:
+                    pass
+
+            page.on("response", on_response)
+
+            # Navigate to PDF URL
+            try:
+                page.goto(pdf_url, wait_until="commit", timeout=30000)
+            except Exception:
+                pass
+
+            # Wait a bit for responses to arrive
+            time.sleep(3)
+
+            # Check captured PDF
+            if captured_pdf:
+                pdf_bytes = captured_pdf[-1]
+                paper.full_text = pdf_extractor.extract_from_bytes(pdf_bytes)
+                pdf_path = self._save_pdf(doi, pdf_bytes)
+                paper.pdf_path = str(pdf_path) if pdf_path else ""
+                paper.source = "browser"
+                logger.info("Browser PDF downloaded (%d bytes)", len(pdf_bytes))
+                return paper
+
+            # Try expect_download as fallback
+            try:
+                with page.expect_download(timeout=15000) as download_info:
+                    page.goto(pdf_url, wait_until="commit", timeout=15000)
+                download = download_info.value
+                tmp = download.path()
+                if tmp:
+                    pdf_bytes = tmp.read_bytes()
+                    if pdf_bytes[:4] == b"%PDF-" and len(pdf_bytes) > 5000:
+                        paper.full_text = pdf_extractor.extract_from_bytes(pdf_bytes)
+                        pdf_path = self._save_pdf(doi, pdf_bytes)
+                        paper.pdf_path = str(pdf_path) if pdf_path else ""
+                        paper.source = "browser"
+                        logger.info("Browser PDF downloaded via download event (%d bytes)", len(pdf_bytes))
+                        return paper
+            except Exception:
+                pass
+
+        except Exception as e:
+            logger.warning("Browser PDF download failed: %s", e)
+        finally:
+            if browser:
+                try:
+                    browser.close()
+                except Exception:
+                    pass
+
+        return None
+
+    def _load_cookies_to_context(self, context) -> None:
+        """Load saved cookies (WebVPN + CARSI) into a CloakBrowser context."""
+        import json as _json
+
+        # Load WebVPN cookies
+        cookie_path = Path(self.config.cookie_path)
+        if cookie_path.exists():
+            try:
+                cookies = _json.loads(cookie_path.read_text(encoding="utf-8"))
+                pw_cookies = []
+                for c in cookies:
+                    pw_c = {
+                        "name": c["name"],
+                        "value": c["value"],
+                        "domain": c.get("domain", ""),
+                        "path": c.get("path", "/"),
+                    }
+                    if c.get("secure"):
+                        pw_c["secure"] = True
+                    if c.get("httpOnly"):
+                        pw_c["httpOnly"] = True
+                    if pw_c["domain"]:
+                        pw_cookies.append(pw_c)
+                if pw_cookies:
+                    context.add_cookies(pw_cookies)
+                    logger.info("Loaded %d WebVPN cookies into browser", len(pw_cookies))
+            except Exception as e:
+                logger.warning("Failed to load cookies into browser: %s", e)
 
     def _try_carsi_pdf(self, doi: str, resolved_url: str, paper: Paper) -> Paper | None:
         """Try to download publisher PDF via CARSI-authenticated session."""

@@ -2,14 +2,19 @@
 
 import json
 import logging
-import re
-import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
 
 import requests
+
+try:
+    from cloakbrowser import launch
+    _HAS_CLOAKBROWSER = True
+except ImportError:
+    launch = None  # type: ignore[assignment]
+    _HAS_CLOAKBROWSER = False
 
 from .config import Config
 
@@ -133,13 +138,15 @@ class CARSIClient:
         return False
 
     def _browser_login(self, publisher: str) -> bool:
-        """Login via CARSI by opening the publisher's institutional login page in the default browser.
+        """Login via CARSI using CloakBrowser to automate the SSO flow.
 
-        Since Selenium-based approaches have visibility issues on some systems,
-        we use the system's default browser and ask the user to complete the login manually.
-        After login, the user pastes the final URL and we extract cookies from Chrome's profile.
+        Opens the publisher's institutional login page, searches for the user's
+        university, and waits for them to complete SSO authentication.
+        Cookies are automatically captured and saved.
         """
-        import webbrowser
+        if not _HAS_CLOAKBROWSER:
+            logger.error("cloakbrowser not installed. Run: pip install cloakbrowser")
+            return False
 
         cfg = self._publisher_configs.get(publisher)
         if not cfg:
@@ -148,110 +155,139 @@ class CARSIClient:
 
         print("\n" + "=" * 60)
         print(f"  CARSI Login: {cfg.name}")
-        print(f"  Opening your default browser...")
         print(f"  ")
         print(f"  Steps:")
-        print(f"  1. Search for your university: {self.config.carsi_idp_name}")
-        print(f"  2. Select it and log in with your campus credentials")
-        print(f"  3. After login, you should be on the publisher's main site")
-        print(f"  4. Copy the URL from your browser and paste it below")
+        print(f"  1. The browser will open the institutional login page")
+        print(f"  2. Search for your university: {self.config.carsi_idp_name}")
+        print(f"  3. Select it and log in with your campus credentials")
+        print(f"  4. After login, the tool will automatically capture cookies")
         print("=" * 60 + "\n")
 
-        webbrowser.open(cfg.login_url)
-
-        print(f"  Browser opened at: {cfg.login_url}")
-        print(f"  Waiting for you to complete login...")
-        print()
-
-        # Wait for user to complete login and paste the final URL
+        browser = None
         try:
-            final_url = input("  Paste the final URL after login (or press Enter to skip): ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print("\n  Login cancelled.")
+            browser = launch(
+                headless=False, humanize=True,
+                args=["--disable-features=CrossOriginOpenerPolicy"],
+            )
+            context = browser.new_context()
+            page = context.new_page()
+
+            # Navigate to publisher's institutional login page
+            page.goto(cfg.login_url, wait_until="domcontentloaded")
+            print(f"  Browser opened at: {cfg.login_url}")
+
+            # Try to search for the university if a search selector is available
+            if cfg.search_selector and self.config.carsi_idp_name:
+                try:
+                    page.wait_for_selector(cfg.search_selector, timeout=10000)
+                    page.fill(cfg.search_selector, self.config.carsi_idp_name)
+                    logger.info("Filled university search: %s", self.config.carsi_idp_name)
+
+                    # Wait for search results and try to click the matching one
+                    if cfg.result_selector:
+                        try:
+                            page.wait_for_selector(cfg.result_selector, timeout=5000)
+                            # Try clicking the result that matches the university name
+                            result_text = page.evaluate(f"""
+                                (() => {{
+                                    const items = document.querySelectorAll('{cfg.result_selector}');
+                                    for (const el of items) {{
+                                        const text = el.textContent || '';
+                                        if (text.includes('{self.config.carsi_idp_name}')) {{
+                                            el.click();
+                                            return text.trim().substring(0, 60);
+                                        }}
+                                    }}
+                                    // If no exact match, click the first result
+                                    if (items.length > 0) {{
+                                        items[0].click();
+                                        return items[0].textContent.trim().substring(0, 60);
+                                    }}
+                                    return null;
+                                }})()
+                            """)
+                            if result_text:
+                                logger.info("Clicked institution: %s", result_text)
+                        except Exception:
+                            pass  # User may need to click manually
+                except Exception:
+                    logger.info("Could not auto-fill search, user will select manually")
+
+            print("  Waiting for SSO login to complete...")
+            print("  (up to 5 minutes)\n")
+
+            # Wait for user to complete SSO — poll until URL indicates success
+            max_wait = 300  # 5 minutes
+            poll_interval = 3
+            elapsed = 0
+            last_url = ""
+
+            while elapsed < max_wait:
+                time.sleep(poll_interval)
+                elapsed += poll_interval
+
+                try:
+                    # Check if user closed the browser
+                    if not context.pages:
+                        logger.info("Browser closed by user.")
+                        return False
+
+                    current_url = page.url
+
+                    if current_url != last_url:
+                        logger.info("Browser URL: %s", current_url[:80])
+                        last_url = current_url
+
+                    # Check if we're back on the publisher site (SSO complete)
+                    on_publisher = any(d in current_url for d in cfg.domains)
+                    on_login_page = any(x in current_url.lower() for x in (
+                        "login", "institutional", "wayf", "saml", "shibboleth", "sso", "cas",
+                    ))
+
+                    if on_publisher and not on_login_page:
+                        logger.info("CARSI login confirmed. URL: %s", current_url)
+                        print("  CARSI login successful!")
+
+                        # Save cookies
+                        cookies = context.cookies()
+                        self._save_cookies(publisher, cookies)
+                        print(f"  Saved {len(cookies)} cookies.")
+                        return True
+
+                except Exception:
+                    logger.warning("Browser connection lost.")
+                    return False
+
+            print("  Login timed out after 5 minutes.")
             return False
 
-        if not final_url:
-            print("  No URL provided. Login skipped.")
+        except Exception as e:
+            logger.error("CARSI browser login failed: %s", e)
             return False
+        finally:
+            if browser:
+                try:
+                    browser.close()
+                except Exception:
+                    pass
 
-        # Check if the URL indicates successful login
-        on_publisher = any(d in final_url for d in cfg.domains)
-        on_login_page = any(x in final_url.lower() for x in ("login", "institutional", "wayf", "saml", "shibboleth"))
+    def _save_cookies(self, publisher: str, cookies: list[dict]) -> None:
+        """Save cookies to the CARSI cookie file for the given publisher."""
+        cookie_file = self._cookie_path(publisher)
+        cookie_file.parent.mkdir(parents=True, exist_ok=True)
 
-        if on_publisher and not on_login_page:
-            logger.info("CARSI login confirmed. URL: %s", final_url)
-            print("\n  CARSI login successful!")
-            # Try to extract cookies from Chrome's cookie database
-            self._extract_chrome_cookies(publisher)
-            return True
-        else:
-            print(f"\n  URL doesn't look like a successful login: {final_url}")
-            print("  Expected to be on the publisher's main site, not a login page.")
-            return False
-
-    def _extract_chrome_cookies(self, publisher: str) -> None:
-        """Try to extract cookies from Chrome's cookie database for the publisher domains."""
-        cfg = self._publisher_configs.get(publisher)
-        if not cfg:
-            return
-
-        # Try to find Chrome's cookie database
-        cookie_paths = [
-            Path.home() / "AppData/Local/Google/Chrome/User Data/Default/Cookies",
-            Path.home() / "AppData/Local/Google/Chrome/User Data/Default/Network/Cookies",
+        # Filter out expired cookies
+        now = time.time()
+        valid_cookies = [
+            c for c in cookies
+            if not c.get("expires") or c.get("expires", 0) == 0 or c.get("expires", 0) > now
         ]
 
-        for cookie_path in cookie_paths:
-            if cookie_path.exists():
-                try:
-                    import sqlite3
-                    # Copy the cookie file to avoid locking issues
-                    import shutil
-                    tmp_cookie = Path(self.config.cache_dir) / "chrome_cookies_tmp.db"
-                    shutil.copy2(cookie_path, tmp_cookie)
-
-                    conn = sqlite3.connect(str(tmp_cookie))
-                    cursor = conn.cursor()
-
-                    # Query cookies for the publisher domains
-                    cookies = []
-                    for domain in cfg.domains:
-                        cursor.execute(
-                            "SELECT name, value, host_key, path FROM cookies WHERE host_key LIKE ?",
-                            (f"%{domain}%",)
-                        )
-                        cookies.extend(cursor.fetchall())
-
-                    conn.close()
-                    tmp_cookie.unlink(missing_ok=True)
-
-                    if cookies:
-                        # Save cookies to the CARSI cookie file
-                        cookie_file = self._cookie_path(publisher)
-                        cookie_file.parent.mkdir(parents=True, exist_ok=True)
-
-                        cookie_data = []
-                        for name, value, host_key, path in cookies:
-                            cookie_data.append({
-                                "name": name,
-                                "value": value,
-                                "domain": host_key,
-                                "path": path,
-                            })
-
-                        cookie_file.write_text(
-                            json.dumps(cookie_data, indent=2, ensure_ascii=False),
-                            encoding="utf-8",
-                        )
-                        logger.info("Extracted %d cookies from Chrome for %s", len(cookie_data), publisher)
-                        print(f"  Extracted {len(cookie_data)} cookies from Chrome.")
-                        return
-
-                except Exception as e:
-                    logger.warning("Failed to extract Chrome cookies: %s", e)
-
-        print("  Note: Could not extract cookies automatically.")
-        print("  The fetcher will try to use your browser session directly.")
+        cookie_file.write_text(
+            json.dumps(valid_cookies, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        logger.info("Saved %d CARSI cookies for %s", len(valid_cookies), publisher)
 
     def close(self):
         for sess in self._sessions.values():
