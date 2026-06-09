@@ -1,6 +1,6 @@
 # InstSci
 
-语言 / Language: [中文](#中文) | [English](#english)
+[中文](#中文) | [English](#english)
 
 ## 中文
 
